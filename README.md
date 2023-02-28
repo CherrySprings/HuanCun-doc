@@ -98,11 +98,6 @@ Here are two examples to briefly explain how MSHR judges the modification of per
 
 More details about directories can be found in the chapter of directory design.
 
-请求控制
-MSHR需要根据请求的内容和读目录的结果判断需要完成哪些子请求，包括是否需要向下Acquire或Release，是否需要向上Probe，是否应该触发一条预取，是否需要修改目录和tag等等；除了子请求，MSHR还要记录需要等待哪些子请求的应答。
-
-MSHR将这些要调度的请求和要等待的应答具体成一个个事件，并用一系列状态寄存器记录这些事件是否完成。s_*寄存器表示要调度的请求，w_*寄存器表示要等待的应答，MSHR在拿到读目录的结果后会把需要完成的事件(s_*和w_*寄存器)置为false.B，表示请求还未发送或应答还没有收到，在事件完成后再将寄存器置为true.B，当所有事件都完成后，该项MSHR就会被释放。
-
 ### Request Control
 
 MSHR needs to judge which sub-requests need to be completed according to the content of the request and the result of reading the directory, including whether to Acquire or Release downward, whether to Probe upward, whether to trigger a prefetch, whether to modify the directory and tag, etc. Besides request, MSHR also needs to record the pending status for sub-request responses.
@@ -210,3 +205,31 @@ In order to let L1 Cache continue to use VIPT, XiangShan's cache system uses har
 Here is an example to illustrate how L2 solves the cache alias problem. As shown in the figure below, there is a block with a virtual address of 0x0000 in DCache, the virtual addresses 0x0000 and 0x1000 are mapped to the same physical address, and the aliases of these two addresses are different. At this time, DCache sends the address of 0x1000 block, and the alias (0x1) is recorded in the user field of the Acquire request. L2 finds that the request hits after reading the directory, but the alias of Acquire (0x1) is different from the alias (0x0) of DCache recorded by L2 at the physical address. So L2 will initiate a Probe sub-request, and record the alias (0x0) to be probed in the Probe data field. After the Probe sub-request is completed, L2 will return this block to DCache, and change the alias in the L2 client directory to is (0x1).
 
 ![alias2](https://xiangshan-doc.readthedocs.io/zh_CN/latest/figs/huancun_cache_alias-2.jpg)
+
+## Miscs
+
+### Request Buffer Design
+
+In order to avoid resource competition and mutual interference when multiple concurrent requests are processed in the Cache at the same time, huancun blocks requests at the granularity of sets. Requests of the same priority (A, B, and C) and the same set cannot enter MSHR at the same time. In order to reduce the performance loss caused by this blocking strategy to cache, we designed Request Buffer to buffer blocked requests, so that subsequent requests of different sets can enter MSHR without blocking.
+
+Considering the characteristics of the number of Tilelink bus requests A>>B and A>>C in the CPU, the Request Buffer only buffers the requests of the A channel, which can reduce the complexity of hardware implementation while improving performance.
+
+The design of the Request Buffer is similar to the reservation station / issue queue in the CPU. When a new request cannot enter the MSHR, it will try to enter the Request Buffer. If there is an empty item in the buffer, the request will be allocated to the corresponding position, and we records the MSHR entry to be freed that this request is waiting for (`wait_table` in the source code). When the MSHR is freed, its MSHR ID will be broadcast to the Request Buffer, and the items in the buffer that are dependent on the MSHR can be "woke up".
+
+When there are multiple requests of the same set in the Request Buffer, in order to ensure that these requests can leave the buffer in FIFO order, a dependency matrix `buffer_dep_mask` is maintained inside the buffer, which records the dependencies between the internal items of the buffer. `buffer_dep_mask[i][j]` set to 1 means that the request at position `i` and `j` are both in the same set, and the request at position `i` arrives later than the request at position `j`, so when the external MSHR is released, request `j` should leave the buffer first.
+
+### Refill Buffer Design
+
+In order to reduce the delay of cache miss, huancun uses Refill Buffer to buffer the data refilled from the lower level cache or memory, so that the refilled data can be directly returned to the upper cache without writing to SRAM first.
+
+### MSHR Alloc (MSHR Allocation Module)
+
+According to the Tilelink specification, in order to avoid deadlock in the system, high-priority requests must be able to interrupt low-priority requests to be executed first, so huancun designed N (N >= 1) abc MSHR, 1 b MSHR, 1 c MSHR.
+
+In the absence of set conflicts, all requests will pick an empty entry in the abc MSHR. When a newly arrived high-priority request conflicts with an existing low-priority request in the MSHR, the high-priority request will enter the dedicated MSHR. For example, b request conflicts with a request set in abc MSHR, then the new b request will be assigned to b MSHR. If c request conflicts with a / b request in abc / b MSHR, the new c request will be assigned into c MSHR.
+
+### ProbeHelper
+
+Since Huancun adopts the inclusive-directory non-inclusive data design, when the client directory cannot store a new cache block (e.g. blockA) due to its limited capacity, it is necessary for the current level cache to send a Probe request to the upper level Cache to probe the cache block (e.g. blockB), and then store the corresponding state of the new cache block (blockA) in the client directory.
+
+In order to simplify the processing flow of a single MSHR, we designed the ProbeHelper to monitor the reading results of the client directory. If a capacity conflict is found, the ProbeHelper will generate a forged B request to probe the target cache block from upper level cache. In this way, there is no need to consider the capacity conflict of client directoy in a single MSHR, which simplifies the design.
